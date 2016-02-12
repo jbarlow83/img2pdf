@@ -838,6 +838,12 @@ def default_layout_fun(imgwidthpx, imgheightpx, ndpi):
     return pagewidth, pageheight, imgwidthpdf, imgheightpdf
 
 
+def get_fixed_dpi_layout_fun(fixed_dpi):
+    def fixed_dpi_layout_fun(imgwidthpx, imgheightpx, ndpi):
+        return default_layout_fun(imgwidthpx, imgheightpx, fixed_dpi)
+    return fixed_dpi_layout_fun
+
+
 def convert(*images, title=None,
             author=None, creator=None, producer=None, creationdate=None,
             moddate=None, subject=None, keywords=None, colorspace=None,
