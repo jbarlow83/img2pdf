@@ -18,6 +18,7 @@
 # <http://www.gnu.org/licenses/>.
 
 import sys
+import os
 import zlib
 import argparse
 from PIL import Image
@@ -27,7 +28,7 @@ from enum import Enum
 from io import BytesIO
 import logging
 
-__version__ = "0.2"
+__version__ = "0.2.1"
 default_dpi = 96.0
 papersizes = {
     "letter": "8.5inx11in",
@@ -55,9 +56,9 @@ FitMode = Enum('FitMode', 'into fill exact shrink enlarge')
 
 PageOrientation = Enum('PageOrientation', 'portrait landscape')
 
-Colorspace = Enum('Colorspace', 'RGB L 1 CMYK CMYK;I RGBA')
+Colorspace = Enum('Colorspace', 'RGB L 1 CMYK CMYK;I RGBA P other')
 
-ImageFormat = Enum('ImageFormat', 'JPEG JPEG2000 TIFF PNG GIF')
+ImageFormat = Enum('ImageFormat', 'JPEG JPEG2000 other')
 
 PageMode = Enum('PageMode', 'none outlines thumbs')
 
@@ -73,7 +74,23 @@ Unit = Enum('Unit', 'pt cm mm inch')
 ImgUnit = Enum('ImgUnit', 'pt cm mm inch perc dpi')
 
 
-class NegativeDimensionException(Exception):
+class NegativeDimensionError(Exception):
+    pass
+
+
+class UnsupportedColorspaceError(Exception):
+    pass
+
+
+class ImageOpenError(Exception):
+    pass
+
+
+class JpegColorspaceError(Exception):
+    pass
+
+
+class PdfTooLargeError(Exception):
     pass
 
 
@@ -95,7 +112,7 @@ def parse(cont, indent=1):
         else:
             return ("%0.4f" % cont).rstrip("0").encode()
     elif isinstance(cont, MyPdfDict):
-        # if cont got an identifier, then adobj() has been called with it
+        # if cont got an identifier, then addobj() has been called with it
         # and a link to it will be added, otherwise add it inline
         if hasattr(cont, "identifier"):
             return ("%d 0 R" % cont.identifier).encode()
@@ -103,13 +120,13 @@ def parse(cont, indent=1):
             return parse(cont.content, indent)
     elif type(cont) is str or isinstance(cont, bytes):
         if type(cont) is str and type(cont) is not bytes:
-            raise Exception(
+            raise TypeError(
                 "parse must be passed a bytes object in py3. Got: %s" % cont)
         return cont
     elif isinstance(cont, list):
         return b"[ "+b" ".join([parse(c, indent) for c in cont])+b" ]"
     else:
-        raise Exception("cannot handle type %s with content %s" % (type(cont),
+        raise TypeError("cannot handle type %s with content %s" % (type(cont),
                                                                    cont))
 
 
@@ -194,8 +211,9 @@ class MyPdfWriter():
         #
         # the choice of binary characters is arbitrary but those four seem to
         # be used elsewhere.
-        stream.write(('%%PDF-%s\n' % self.version).encode('ascii'))
-        stream.write(b'%\xe2\xe3\xcf\xd3\n')
+        pdfheader = ('%%PDF-%s\n' % self.version).encode('ascii')
+        pdfheader += b'%\xe2\xe3\xcf\xd3\n'
+        stream.write(pdfheader)
 
         # From section 3.4.3 of the PDF Reference (version 1.7):
         #
@@ -217,14 +235,17 @@ class MyPdfWriter():
         #  > If the file’s end-of-line marker is a single character (either a
         #  > carriage return or a line feed), it is preceded by a single space;
         #
-        # Since we chose to use a single character eol marker, we preceed it by
+        # Since we chose to use a single character eol marker, we precede it by
         # a space
+        pos = len(pdfheader)
         xreftable.append(b"0000000000 65535 f \n")
         for o in self.objects:
-            xreftable.append(("%010d 00000 n \n" % stream.tell()).encode())
-            stream.write(o.tostring())
+            xreftable.append(("%010d 00000 n \n" % pos).encode())
+            content = o.tostring()
+            stream.write(content)
+            pos += len(content)
 
-        xrefoffset = stream.tell()
+        xrefoffset = pos
         stream.write(b"xref\n")
         stream.write(("0 %d\n" % len(xreftable)).encode())
         for x in xreftable:
@@ -347,8 +368,8 @@ class pdfdoc(object):
         elif color == Colorspace.CMYK or color == Colorspace['CMYK;I']:
             colorspace = PdfName.DeviceCMYK
         else:
-            logging.error("unsupported color space: %s", color.name)
-            exit(1)
+            raise UnsupportedColorspaceError("unsupported color space: %s"
+                                             % color.name)
 
         # either embed the whole jpeg or deflate the bitmap representation
         if imgformat is ImageFormat.JPEG:
@@ -367,7 +388,7 @@ class pdfdoc(object):
         image[PdfName.Width] = imgwidthpx
         image[PdfName.Height] = imgheightpx
         image[PdfName.ColorSpace] = colorspace
-        # hardcoded as PIL doesnt provide bits for non-jpeg formats
+        # hardcoded as PIL doesn't provide bits for non-jpeg formats
         image[PdfName.BitsPerComponent] = 8
 
         if color == Colorspace['CMYK;I']:
@@ -443,7 +464,7 @@ class pdfdoc(object):
         elif self.panes in [PageMode.none, None]:
             pass
         else:
-            raise Exception("unknown page mode: %s" % self.panes)
+            raise ValueError("unknown page mode: %s" % self.panes)
 
         if self.fit_window:
             catalog[PdfName.ViewerPreferences][PdfName.FitWindow] = TrueObject
@@ -472,7 +493,7 @@ class pdfdoc(object):
         initial_page = self.writer.pagearray[0]
         # we set the open action here to make sure we open on the requested
         # initial page but this value might be overwritten by a custom open
-        # action later while still taking the requested inital page into
+        # action later while still taking the requested initial page into
         # account
         if self.initial_page is not None:
             initial_page = self.writer.pagearray[self.initial_page - 1]
@@ -497,7 +518,7 @@ class pdfdoc(object):
         elif self.magnification is None:
             pass
         else:
-            raise Exception("unknown magnification: %s" % self.magnification)
+            raise ValueError("unknown magnification: %s" % self.magnification)
 
         if self.page_layout == PageLayout.single:
             catalog[PdfName.PageLayout] = PdfName.SinglePage
@@ -510,50 +531,30 @@ class pdfdoc(object):
         elif self.page_layout is None:
             pass
         else:
-            raise Exception("unknown page layout: %s" % self.page_layout)
+            raise ValueError("unknown page layout: %s" % self.page_layout)
 
         # now write out the PDF
         if self.with_pdfrw:
             self.writer.trailer.Info = self.info
             self.writer.write(outputstream)
         else:
-            self.writer.tostream(outputstream)
-        return
+            self.writer.tostream(self.info, outputstream)
 
 
-def read_image(rawdata, colorspace):
-    im = BytesIO(rawdata)
-    im.seek(0)
-    try:
-        imgdata = Image.open(im)
-    except IOError as e:
-        # test if it is a jpeg2000 image
-        if rawdata[:12] != "\x00\x00\x00\x0C\x6A\x50\x20\x20\x0D\x0A\x87\x0A":
-            logging.error("cannot read input image (not jpeg2000)")
-            logging.error("PIL: error reading image: %s", e)
-            exit(1)
-        # image is jpeg2000
-        imgwidthpx, imgheightpx, ics = parsejp2(rawdata)
-        imgformat = ImageFormat.JPEG2000
+def get_imgmetadata(imgdata, imgformat, default_dpi, colorspace, rawdata=None):
+    if imgformat == ImageFormat.JPEG2000 \
+            and rawdata is not None and imgdata is None:
+        # this codepath gets called if the PIL installation is not able to
+        # handle JPEG2000 files
+        imgwidthpx, imgheightpx, ics, hdpi, vdpi = parsejp2(rawdata)
 
-        # TODO: read real dpi from input jpeg2000 image
-        ndpi = (default_dpi, default_dpi)
-        logging.debug("input dpi = %d x %d", *ndpi)
-
-        if colorspace:
-            color = colorspace
-            logging.debug("input colorspace (forced) = %s", ics)
-        else:
-            color = ics
-            logging.debug("input colorspace = %s", ics)
+        if hdpi is None:
+            hdpi = default_dpi
+        if vdpi is None:
+            vdpi = default_dpi
+        ndpi = (hdpi, vdpi)
     else:
         imgwidthpx, imgheightpx = imgdata.size
-        imgformat = None
-        for f in ImageFormat:
-            if f.name == imgdata.format:
-                imgformat = f
-        if imgformat is None:
-            raise Exception("unknown PIL image format: %s" % imgdata.format)
 
         ndpi = imgdata.info.get("dpi", (default_dpi, default_dpi))
         # In python3, the returned dpi value for some tiff images will
@@ -562,66 +563,118 @@ def read_image(rawdata, colorspace):
         # float into an integer by rounding.
         # Search online for the 72.009 dpi problem for more info.
         ndpi = (int(round(ndpi[0])), int(round(ndpi[1])))
-        logging.debug("input dpi = %d x %d", *ndpi)
+        ics = imgdata.mode
 
-        if colorspace:
-            color = colorspace
-            logging.debug("input colorspace (forced) = %s", color)
-        else:
-            color = None
-            for c in Colorspace:
-                if c.name == imgdata.mode:
-                    color = c
-            if color is None:
-                raise Exception("unknown PIL colorspace: %s" % imgdata.mode)
-            if color == Colorspace.CMYK and imgformat == ImageFormat.JPEG:
-                # Adobe inverts CMYK JPEGs for some reason, and others
-                # have followed suit as well. Some software assumes the
-                # JPEG is inverted if the Adobe tag (APP14), while other
-                # software assumes all CMYK JPEGs are inverted. I don't
-                # have enough experience with these to know which is
-                # better for images currently in the wild, so I'm going
-                # with the first approach for now.
-                if "adobe" in imgdata.info:
-                    color = Colorspace['CMYK;I']
-            logging.debug("input colorspace = %s", color.name)
+    logging.debug("input dpi = %d x %d", *ndpi)
+
+    if colorspace:
+        color = colorspace
+        logging.debug("input colorspace (forced) = %s", color)
+    else:
+        color = None
+        for c in Colorspace:
+            if c.name == ics:
+                color = c
+        if color is None:
+            color = Colorspace.other
+        if color == Colorspace.CMYK and imgformat == ImageFormat.JPEG:
+            # Adobe inverts CMYK JPEGs for some reason, and others
+            # have followed suit as well. Some software assumes the
+            # JPEG is inverted if the Adobe tag (APP14), while other
+            # software assumes all CMYK JPEGs are inverted. I don't
+            # have enough experience with these to know which is
+            # better for images currently in the wild, so I'm going
+            # with the first approach for now.
+            if "adobe" in imgdata.info:
+                color = Colorspace['CMYK;I']
+        logging.debug("input colorspace = %s", color.name)
 
     logging.debug("width x height = %dpx x %dpx", imgwidthpx, imgheightpx)
+
+    return (color, ndpi, imgwidthpx, imgheightpx)
+
+
+def read_images(rawdata, colorspace, first_frame_only=False):
+    im = BytesIO(rawdata)
+    im.seek(0)
+    imgdata = None
+    try:
+        imgdata = Image.open(im)
+    except IOError as e:
+        # test if it is a jpeg2000 image
+        if rawdata[:12] != "\x00\x00\x00\x0C\x6A\x50\x20\x20\x0D\x0A\x87\x0A":
+            raise ImageOpenError("cannot read input image (not jpeg2000). "
+                                 "PIL: error reading image: %s" % e)
+        # image is jpeg2000
+        imgformat = ImageFormat.JPEG2000
+    else:
+        imgformat = None
+        for f in ImageFormat:
+            if f.name == imgdata.format:
+                imgformat = f
+        if imgformat is None:
+            imgformat = ImageFormat.other
+
     logging.debug("imgformat = %s", imgformat.name)
 
     # depending on the input format, determine whether to pass the raw
     # image or the zlib compressed color information
     if imgformat == ImageFormat.JPEG or imgformat == ImageFormat.JPEG2000:
+        color, ndpi, imgwidthpx, imgheightpx = get_imgmetadata(
+                imgdata, imgformat, default_dpi, colorspace, rawdata)
         if color == Colorspace['1']:
-            logging.error("jpeg can't be monochrome")
-            exit(1)
-        imgdata = rawdata
+            raise JpegColorspaceError("jpeg can't be monochrome")
+        if color == Colorspace['P']:
+            raise JpegColorspaceError("jpeg can't have a color palette")
+        if color == Colorspace['RGBA']:
+            raise JpegColorspaceError("jpeg can't have an alpha channel")
+        im.close()
+        return [(color, ndpi, imgformat, rawdata, imgwidthpx, imgheightpx)]
     else:
-        # because we do not support /CCITTFaxDecode
-        if color == Colorspace['1']:
-            logging.debug("Converting colorspace 1 to L")
-            imgdata = imgdata.convert('L')
-            color = Colorspace.L
-        elif color in [Colorspace.RGB, Colorspace.L, Colorspace.CMYK,
-                       Colorspace["CMYK;I"]]:
-            logging.debug("Colorspace is OK: %s", color)
-        elif color in [Colorspace.RGBA]:
-            logging.debug("Converting colorspace %s to RGB", color)
-            imgdata = imgdata.convert('RGB')
-            color = Colorspace.RGB
-        else:
-            raise Exception("unknown colorspace: %s" % color.name)
-        img = imgdata.tobytes()
+        result = []
+        img_page_count = 0
+        # loop through all frames of the image (example: multipage TIFF)
+        while True:
+            try:
+                imgdata.seek(img_page_count)
+            except EOFError:
+                break
+
+            if first_frame_only and img_page_count > 0:
+                break
+
+            logging.debug("Converting frame: %d" % img_page_count)
+
+            color, ndpi, imgwidthpx, imgheightpx = get_imgmetadata(
+                    imgdata, imgformat, default_dpi, colorspace)
+
+            # because we do not support /CCITTFaxDecode
+            if color == Colorspace['1']:
+                logging.debug("Converting colorspace 1 to L")
+                newimg = imgdata.convert('L')
+                color = Colorspace.L
+            elif color in [Colorspace.RGB, Colorspace.L, Colorspace.CMYK,
+                           Colorspace["CMYK;I"]]:
+                logging.debug("Colorspace is OK: %s", color)
+                newimg = imgdata
+            elif color in [Colorspace.RGBA, Colorspace.P, Colorspace.other]:
+                logging.debug("Converting colorspace %s to RGB", color)
+                newimg = imgdata.convert('RGB')
+                color = Colorspace.RGB
+            else:
+                raise ValueError("unknown colorspace: %s" % color.name)
+            imggz = zlib.compress(newimg.tobytes())
+            result.append((color, ndpi, imgformat, imggz, imgwidthpx,
+                           imgheightpx))
+            img_page_count += 1
         # the python-pil version 2.3.0-1ubuntu3 in Ubuntu does not have the
         # close() method
         try:
             imgdata.close()
         except AttributeError:
             pass
-        imgdata = zlib.compress(img)
-    im.close()
-
-    return color, ndpi, imgformat, imgdata, imgwidthpx, imgheightpx
+        im.close()
+        return result
 
 
 # converts a length in pixels to a length in PDF units (1/72 of an inch)
@@ -644,16 +697,18 @@ def in_to_pt(length):
 def get_layout_fun(pagesize, imgsize, border, fit, auto_orient):
     def fitfun(fit, imgwidth, imgheight, fitwidth, fitheight):
         if fitwidth is None and fitheight is None:
-            raise Exception("fitwidth and fitheight cannot both be None")
+            raise ValueError("fitwidth and fitheight cannot both be None")
         # if fit is fill or enlarge then it is okay if one of the dimensions
         # are negative but one of them must still be positive
         # if fit is not fill or enlarge then both dimensions must be positive
         if fit in [FitMode.fill, FitMode.enlarge] and \
-                (fitwidth < 0 and fitheight < 0):
-            raise Exception("cannot fit into a rectangle where both "
-                            "dimensions are negative")
+                fitwidth is not None and fitwidth < 0 and \
+                fitheight is not None and fitheight < 0:
+            raise ValueError("cannot fit into a rectangle where both "
+                             "dimensions are negative")
         elif fit not in [FitMode.fill, FitMode.enlarge] and \
-                (fitwidth < 0 or fitheight < 0):
+                ((fitwidth is not None and fitwidth < 0) or
+                    (fitheight is not None and fitheight < 0)):
             raise Exception("cannot fit into a rectangle where either "
                             "dimensions are negative")
 
@@ -671,7 +726,7 @@ def get_layout_fun(pagesize, imgsize, border, fit, auto_orient):
                 newimgwidth = fitwidth
                 newimgheight = (newimgwidth * imgheight)/imgwidth
             else:
-                raise Exception("fitwidth and fitheight cannot both be None")
+                raise ValueError("fitwidth and fitheight cannot both be None")
             return newimgwidth, newimgheight
         if fit is None or fit == FitMode.into:
             return default()
@@ -689,7 +744,7 @@ def get_layout_fun(pagesize, imgsize, border, fit, auto_orient):
                 newimgwidth = fitwidth
                 newimgheight = (newimgwidth * imgheight)/imgwidth
             else:
-                raise Exception("fitwidth and fitheight cannot both be None")
+                raise ValueError("fitwidth and fitheight cannot both be None")
             return newimgwidth, newimgheight
         elif fit == FitMode.exact:
             if fitwidth is not None and fitheight is not None:
@@ -701,7 +756,8 @@ def get_layout_fun(pagesize, imgsize, border, fit, auto_orient):
                 newimgwidth = fitwidth
                 newimgheight = (newimgwidth * imgheight)/imgwidth
             else:
-                raise Exception("fitwidth and fitheight cannot both be None")
+                raise ValueError("fitwidth and fitheight cannot both be None")
+            return newimgwidth, newimgheight
         elif fit == FitMode.shrink:
             if fitwidth is not None and fitheight is not None:
                 if imgwidth <= fitwidth and imgheight <= fitheight:
@@ -713,7 +769,7 @@ def get_layout_fun(pagesize, imgsize, border, fit, auto_orient):
                 if imgwidth <= fitwidth:
                     return imgwidth, imgheight
             else:
-                raise Exception("fitwidth and fitheight cannot both be None")
+                raise ValueError("fitwidth and fitheight cannot both be None")
             return default()
         elif fit == FitMode.enlarge:
             if fitwidth is not None and fitheight is not None:
@@ -726,7 +782,7 @@ def get_layout_fun(pagesize, imgsize, border, fit, auto_orient):
                 if imgwidth > fitwidth:
                     return imgwidth, imgheight
             else:
-                raise Exception("fitwidth and fitheight cannot both be None")
+                raise ValueError("fitwidth and fitheight cannot both be None")
             return default()
         else:
             raise NotImplementedError
@@ -760,23 +816,23 @@ def get_layout_fun(pagesize, imgsize, border, fit, auto_orient):
                 pagewidth, pageheight = pagesize[0], pagesize[1]
                 newborder = border
             if pagewidth is not None:
-                fitwidth = pagewidth-2*newborder[0]
+                fitwidth = pagewidth-2*newborder[1]
             else:
                 fitwidth = None
             if pageheight is not None:
-                fitheight = pageheight-2*newborder[1]
+                fitheight = pageheight-2*newborder[0]
             else:
                 fitheight = None
             if fit in [FitMode.fill, FitMode.enlarge] and \
                     fitwidth is not None and fitwidth < 0 and \
                     fitheight is not None and fitheight < 0:
-                raise NegativeDimensionException(
+                raise NegativeDimensionError(
                     "at least one border dimension musts be smaller than half "
                     "the respective page dimension")
             elif fit not in [FitMode.fill, FitMode.enlarge] \
                     and ((fitwidth is not None and fitwidth < 0) or
                          (fitheight is not None and fitheight < 0)):
-                raise NegativeDimensionException(
+                raise NegativeDimensionError(
                     "one border dimension is larger than half of the "
                     "respective page dimension")
             imgwidthpdf, imgheightpdf = \
@@ -843,14 +899,19 @@ def get_fixed_dpi_layout_fun(fixed_dpi):
 
     >>> layout_fun = get_fixed_dpi_layout_fun((300, 300))
     >>> convert(image1, layout_fun=layout_fun, ... outputstream=...)
-
     """
-
     def fixed_dpi_layout_fun(imgwidthpx, imgheightpx, ndpi):
         return default_layout_fun(imgwidthpx, imgheightpx, fixed_dpi)
     return fixed_dpi_layout_fun
 
 
+# given one or more input image, depending on outputstream, either return a
+# string containing the whole PDF if outputstream is None or write the PDF
+# data to the given file-like object and return None
+#
+# Input images can be given as file like objects (they must implement read()),
+# as a binary string representing the image content or as filenames to the
+# images.
 def convert(*images, title=None,
             author=None, creator=None, producer=None, creationdate=None,
             moddate=None, subject=None, keywords=None, colorspace=None,
@@ -858,7 +919,7 @@ def convert(*images, title=None,
             viewer_initial_page=None, viewer_magnification=None,
             viewer_page_layout=None, viewer_fit_window=False,
             viewer_center_window=False, viewer_fullscreen=False,
-            with_pdfrw=True, outputstream=None):
+            with_pdfrw=True, outputstream=None, first_frame_only=False):
 
     pdf = pdfdoc("1.3", title, author, creator, producer, creationdate,
                  moddate, subject, keywords, nodate, viewer_panes,
@@ -866,27 +927,43 @@ def convert(*images, title=None,
                  viewer_fit_window, viewer_center_window, viewer_fullscreen,
                  with_pdfrw)
 
-    for rawdata in images:
-        color, ndpi, imgformat, imgdata, imgwidthpx, imgheightpx = \
-            read_image(rawdata, colorspace)
-        pagewidth, pageheight, imgwidthpdf, imgheightpdf = \
-            layout_fun(imgwidthpx, imgheightpx, ndpi)
-        if pagewidth < 3.00 or pageheight < 3.00:
-            logging.warning("pdf width or height is below 3.00 - too small "
-                            "for some viewers!")
-        elif pagewidth > 14400.0 or pageheight > 14400.0:
-            logging.error("pdf width or height must not exceed 200 inches.")
-            exit(1)
-        # the image is always centered on the page
-        imgxpdf = (pagewidth - imgwidthpdf)/2.0
-        imgypdf = (pageheight - imgheightpdf)/2.0
-        pdf.add_imagepage(color, imgwidthpx, imgheightpx, imgformat, imgdata,
-                          imgwidthpdf, imgheightpdf, imgxpdf, imgypdf,
-                          pagewidth, pageheight)
+    for img in images:
+        # img is allowed to be a path, a binary string representing image data
+        # or a file-like object (really anything that implements read())
+        try:
+            rawdata = img.read()
+        except AttributeError:
+            # the thing doesn't have a read() function, so try if we can treat
+            # it as a file name
+            try:
+                with open(img, "rb") as f:
+                    rawdata = f.read()
+            except:
+                # whatever the exception is (string could contain NUL
+                # characters or the path could just not exist) it's not a file
+                # name so we now try treating it as raw image content
+                rawdata = img
+
+        for color, ndpi, imgformat, imgdata, imgwidthpx, imgheightpx \
+                in read_images(rawdata, colorspace, first_frame_only):
+            pagewidth, pageheight, imgwidthpdf, imgheightpdf = \
+                layout_fun(imgwidthpx, imgheightpx, ndpi)
+            if pagewidth < 3.00 or pageheight < 3.00:
+                logging.warning("pdf width or height is below 3.00 - too "
+                                "small for some viewers!")
+            elif pagewidth > 14400.0 or pageheight > 14400.0:
+                raise PdfTooLargeError(
+                        "pdf width or height must not exceed 200 inches.")
+            # the image is always centered on the page
+            imgxpdf = (pagewidth - imgwidthpdf)/2.0
+            imgypdf = (pageheight - imgheightpdf)/2.0
+            pdf.add_imagepage(color, imgwidthpx, imgheightpx, imgformat,
+                              imgdata, imgwidthpdf, imgheightpdf, imgxpdf,
+                              imgypdf, pagewidth, pageheight)
 
     if outputstream:
         pdf.tostream(outputstream)
-        return outputstream
+        return
 
     return pdf.tostring()
 
@@ -988,11 +1065,16 @@ def parse_pagesize_rectarg(string):
     if papersizes.get(string.lower()):
         string = papersizes[string.lower()]
     if 'x' not in string:
-        raise argparse.ArgumentTypeError("size must contain 'x' character")
-    w, h = string.split('x', 1)
+        # if there is no separating "x" in the string, then the string is
+        # interpreted as the width
+        w = parse_num(string, "width")
+        h = None
+    else:
+        w, h = string.split('x', 1)
+        w = parse_num(w, "width")
+        h = parse_num(h, "height")
     if transposed:
         w, h = h, w
-    w, h = parse_num(w, "width"), parse_num(h, "height")
     if w is None and h is None:
         raise argparse.ArgumentTypeError("at least one dimension must be "
                                          "specified")
@@ -1006,11 +1088,16 @@ def parse_imgsize_rectarg(string):
     if papersizes.get(string.lower()):
         string = papersizes[string.lower()]
     if 'x' not in string:
-        raise argparse.ArgumentTypeError("size must contain 'x' character")
-    w, h = string.split('x', 1)
+        # if there is no separating "x" in the string, then the string is
+        # interpreted as the width
+        w = parse_imgsize_num(string, "width")
+        h = None
+    else:
+        w, h = string.split('x', 1)
+        w = parse_imgsize_num(w, "width")
+        h = parse_imgsize_num(h, "height")
     if transposed:
         w, h = h, w
-    w, h = parse_imgsize_num(w, "width"), parse_imgsize_num(h, "height")
     if w is None and h is None:
         raise argparse.ArgumentTypeError("at least one dimension must be "
                                          "specified")
@@ -1045,11 +1132,18 @@ def parse_borderarg(string):
 
 def input_images(path):
     if path == '-':
-        rawdata = sys.stdin.buffer.read()
+        # we slurp in all data from stdin because we need to seek in it later
+        result = sys.stdin.buffer.read()
+        if len(result) == 0:
+            raise argparse.ArgumentTypeError("\"%s\" is empty" % path)
     else:
         try:
+            if os.path.getsize(path) == 0:
+                raise argparse.ArgumentTypeError("\"%s\" is empty" % path)
+            # test-read a byte from it so that we can abort early in case
+            # we cannot read data from the file
             with open(path, "rb") as im:
-                rawdata = im.read()
+                im.read(1)
         except IsADirectoryError:
             raise argparse.ArgumentTypeError(
                 "\"%s\" is a directory" % path)
@@ -1059,9 +1153,8 @@ def input_images(path):
         except FileNotFoundError:
             raise argparse.ArgumentTypeError(
                 "\"%s\" does not exist" % path)
-    if len(rawdata) == 0:
-        raise argparse.ArgumentTypeError("\"%s\" is empty" % path)
-    return rawdata
+        result = path
+    return result
 
 
 def parse_fitarg(string):
@@ -1139,7 +1232,6 @@ def valid_date(string):
             pass
         else:
             return datetime.utcfromtimestamp(int(utime))
-
     raise argparse.ArgumentTypeError("cannot parse date: %s" % string)
 
 
@@ -1325,6 +1417,14 @@ RGB.''')
              "https://github.com/pmaupin/pdfrw/issues/39) or if you want the "
              "PDF code to be more human readable.")
 
+    outargs.add_argument(
+        "--first-frame-only", action="store_true",
+        help="By default, img2pdf will convert multi-frame images like "
+             "multi-page TIFF or animated GIF images to one page per frame. "
+             "This option will only let the first frame of every multi-frame "
+             "input image be converted into a page in the resulting PDF."
+            )
+
     sizeargs = parser.add_argument_group(
         title='Image and page size and layout arguments',
         description='''\
@@ -1352,13 +1452,16 @@ allowed units are cm (centimeter), mm (millimeter), and in (inch).
 Any size argument of the format LxL in the options below specifies the width
 and height of a rectangle where the first L represents the width and the second
 L represents the height with an optional unit following each value as described
-above.  Either width or height may be omitted but in that case the separating x
-must still be present. Instead of giving the width and height explicitly, you
-may also specify some (case-insensitive) common page sizes such as letter and
-A4.  See the epilogue at the bottom for a complete list of the valid sizes.
+above.  Either width or height may be omitted. If the height is omitted, the
+separating x can be omitted as well. Omitting the width requires to prefix the
+height with the separating x. The missing dimension will be chosen so to not
+change the image aspect ratio. Instead of giving the width and height
+explicitly, you may also specify some (case-insensitive) common page sizes such
+as letter and A4.  See the epilogue at the bottom for a complete list of the
+valid sizes.
 
 The --fit option scales to fit the image into a rectangle that is either
-derived from the the --imgsize option or otherwise from the --pagesize option.
+derived from the --imgsize option or otherwise from the --pagesize option.
 If the --border option is given in addition to the --imgsize option while the
 --pagesize option is not given, then the page size will be calculated from the
 image size, respecting the border setting. If the --border option is given in
@@ -1520,21 +1623,28 @@ values set via the --border option.
                           parser.prog)
             exit(2)
 
-    convert(
-        *args.images, title=args.title, author=args.author,
-        creator=args.creator, producer=args.producer,
-        creationdate=args.creationdate, moddate=args.moddate,
-        subject=args.subject, keywords=args.keywords,
-        colorspace=args.colorspace, nodate=args.nodate,
-        layout_fun=layout_fun, viewer_panes=args.viewer_panes,
-        viewer_initial_page=args.viewer_initial_page,
-        viewer_magnification=args.viewer_magnification,
-        viewer_page_layout=args.viewer_page_layout,
-        viewer_fit_window=args.viewer_fit_window,
-        viewer_center_window=args.viewer_center_window,
-        viewer_fullscreen=args.viewer_fullscreen,
-        with_pdfrw=not args.without_pdfrw,
-        outputstream=args.output)
+    try:
+        convert(
+            *args.images, title=args.title, author=args.author,
+            creator=args.creator, producer=args.producer,
+            creationdate=args.creationdate, moddate=args.moddate,
+            subject=args.subject, keywords=args.keywords,
+            colorspace=args.colorspace, nodate=args.nodate,
+            layout_fun=layout_fun, viewer_panes=args.viewer_panes,
+            viewer_initial_page=args.viewer_initial_page,
+            viewer_magnification=args.viewer_magnification,
+            viewer_page_layout=args.viewer_page_layout,
+            viewer_fit_window=args.viewer_fit_window,
+            viewer_center_window=args.viewer_center_window,
+            viewer_fullscreen=args.viewer_fullscreen, with_pdfrw=not
+            args.without_pdfrw, outputstream=args.output,
+            first_frame_only=args.first_frame_only)
+    except Exception as e:
+        logging.error("error: " + str(e))
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+        exit(1)
 
 if __name__ == '__main__':
     main()
