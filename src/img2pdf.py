@@ -613,12 +613,13 @@ def transcode_monochrome(imgdata):
     """Convert the open PIL.Image imgdata to compressed CCITT Group4 data"""
 
     from PIL import TiffImagePlugin
+    from tempfile import TemporaryFile
 
     logging.debug("Converting monochrome to CCITT Group4")
 
     # Convert the image to Group 4 in memory. If libtiff is not installed and
     # Pillow is not compiled against it, .save() will raise an exception.
-    newimgio = BytesIO()
+    newimgio = TemporaryFile()
     imgdata.save(newimgio, format='TIFF', compression='group4')
 
     # Open new image in memory
